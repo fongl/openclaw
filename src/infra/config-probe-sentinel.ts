@@ -60,3 +60,15 @@ export async function deleteConfigProbeSentinel(
   const filePath = resolveConfigProbeSentinelPath(env);
   await fsAsync.unlink(filePath).catch(() => {});
 }
+
+/**
+ * Returns true if the sentinel's writtenAt timestamp is older than maxAgeMs.
+ * Stale sentinels are left over from OOM kills, operator restarts, or other
+ * non-config-failure restarts and should be ignored rather than triggering rollback.
+ */
+export function isConfigProbeSentinelStale(
+  sentinel: ConfigProbeSentinel,
+  maxAgeMs = 10 * 60 * 1000,
+): boolean {
+  return Date.now() - sentinel.writtenAt > maxAgeMs;
+}

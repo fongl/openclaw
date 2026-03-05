@@ -26,7 +26,6 @@ import { clearAgentRunContext, onAgentEvent } from "../infra/agent-events.js";
 import {
   deleteConfigProbeSentinel,
   readConfigProbeSentinel,
-  writeConfigProbeSentinelSync,
 } from "../infra/config-probe-sentinel.js";
 import {
   ensureControlUiAssetsBuilt,
@@ -42,7 +41,6 @@ import { getMachineDisplayName } from "../infra/machine-name.js";
 import { ensureOpenClawCliOnPath } from "../infra/path-env.js";
 import {
   emitGatewayRestart,
-  hasUnconsumedRestartSignal,
   setGatewaySigusr1RestartPolicy,
   setPreRestartDeferralCheck,
 } from "../infra/restart.js";
@@ -298,14 +296,7 @@ async function scheduleStartupConfigProbe(params: {
     return;
   }
 
-  // Write new sentinel with incremented attempt, then restart
-  if (!hasUnconsumedRestartSignal()) {
-    try {
-      writeConfigProbeSentinelSync({ attempt: sentinel.attempt + 1 });
-    } catch {
-      // Best-effort
-    }
-  }
+  // Sentinel is already on disk (written at startup by run.ts); just restart.
   emitGatewayRestart();
 }
 
