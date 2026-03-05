@@ -6,12 +6,14 @@ import { isRestartEnabled } from "../config/commands.js";
 import type { loadConfig } from "../config/config.js";
 import { startGmailWatcherWithLogs } from "../hooks/gmail-watcher-lifecycle.js";
 import { stopGmailWatcher } from "../hooks/gmail-watcher.js";
+import { writeConfigProbeSentinelSync } from "../infra/config-probe-sentinel.js";
 import { isTruthyEnvValue } from "../infra/env.js";
 import type { HeartbeatRunner } from "../infra/heartbeat-runner.js";
 import { resetDirectoryCache } from "../infra/outbound/target-resolver.js";
 import {
   deferGatewayRestartUntilIdle,
   emitGatewayRestart,
+  hasUnconsumedRestartSignal,
   setGatewaySigusr1RestartPolicy,
 } from "../infra/restart.js";
 import { setCommandLaneConcurrency, getTotalQueueSize } from "../process/command-queue.js";
@@ -184,6 +186,18 @@ export function createGatewayReloadHandlers(params: {
       }
       return details;
     };
+
+    /** Write the config probe sentinel synchronously (just before SIGUSR1 fires). */
+    const maybeWriteSentinel = (attempt = 0) => {
+      if (!hasUnconsumedRestartSignal()) {
+        try {
+          writeConfigProbeSentinelSync({ attempt });
+        } catch {
+          // Best-effort; don't block the restart
+        }
+      }
+    };
+
     const active = getActiveCounts();
 
     if (active.totalActive > 0) {
@@ -206,6 +220,7 @@ export function createGatewayReloadHandlers(params: {
           onReady: () => {
             restartPending = false;
             params.logReload.info("all operations and replies completed; restarting gateway now");
+            maybeWriteSentinel();
           },
           onTimeout: (_pending, elapsedMs) => {
             const remaining = formatActiveDetails(getActiveCounts());
@@ -213,18 +228,21 @@ export function createGatewayReloadHandlers(params: {
             params.logReload.warn(
               `restart timeout after ${elapsedMs}ms with ${remaining.join(", ")} still active; restarting anyway`,
             );
+            maybeWriteSentinel();
           },
           onCheckError: (err) => {
             restartPending = false;
             params.logReload.warn(
               `restart deferral check failed (${String(err)}); restarting gateway now`,
             );
+            maybeWriteSentinel();
           },
         },
       });
     } else {
       // No active operations or pending replies, restart immediately
       params.logReload.warn(`config change requires gateway restart (${reasons})`);
+      maybeWriteSentinel();
       const emitted = emitGatewayRestart();
       if (!emitted) {
         params.logReload.info("gateway restart already scheduled; skipping duplicate signal");

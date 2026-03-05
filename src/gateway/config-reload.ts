@@ -1,9 +1,14 @@
+import { createHash } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import chokidar from "chokidar";
 import type { OpenClawConfig, ConfigFileSnapshot, GatewayReloadMode } from "../config/config.js";
 import { formatConfigIssueLines } from "../config/issue-format.js";
 import { isPlainObject } from "../utils.js";
 import { buildGatewayReloadPlan, type GatewayReloadPlan } from "./config-reload-plan.js";
+
+const CONFIG_BACKUP_MAX = 10;
 
 export { buildGatewayReloadPlan };
 export type { GatewayReloadPlan } from "./config-reload-plan.js";
@@ -69,6 +74,64 @@ export type GatewayConfigReloader = {
   stop: () => Promise<void>;
 };
 
+/**
+ * Back up the config file before applying a new snapshot.
+ * Keeps at most CONFIG_BACKUP_MAX timestamped backups; skips if content is unchanged.
+ * Exported for use by the startup probe rollback logic.
+ */
+export async function backupConfigFileBeforeReload(watchPath: string): Promise<void> {
+  const dir = path.dirname(watchPath);
+  const base = path.basename(watchPath);
+  const bakPrefix = `${base}.bak.`;
+
+  let currentContent: Buffer;
+  try {
+    currentContent = await fs.readFile(watchPath);
+  } catch {
+    return;
+  }
+  const currentHash = createHash("sha256").update(currentContent).digest("hex");
+
+  let entries: string[];
+  try {
+    const all = await fs.readdir(dir);
+    entries = all
+      .filter((e) => e.startsWith(bakPrefix))
+      .toSorted()
+      .map((e) => path.join(dir, e));
+  } catch {
+    entries = [];
+  }
+
+  if (entries.length > 0) {
+    try {
+      const lastContent = await fs.readFile(entries[entries.length - 1]);
+      const lastHash = createHash("sha256").update(lastContent).digest("hex");
+      if (lastHash === currentHash) {
+        return;
+      }
+    } catch {
+      // Best-effort; proceed with backup
+    }
+  }
+
+  const suffix = new Date().toISOString().replace(/[:.]/g, "-");
+  const dest = `${watchPath}.bak.${suffix}`;
+  try {
+    await fs.copyFile(watchPath, dest);
+  } catch {
+    return;
+  }
+
+  const updated = [...entries, dest];
+  if (updated.length > CONFIG_BACKUP_MAX) {
+    const toDelete = updated.slice(0, updated.length - CONFIG_BACKUP_MAX);
+    for (const old of toDelete) {
+      await fs.unlink(old).catch(() => {});
+    }
+  }
+}
+
 export function startGatewayConfigReloader(opts: {
   initialConfig: OpenClawConfig;
   readSnapshot: () => Promise<ConfigFileSnapshot>;
@@ -80,6 +143,8 @@ export function startGatewayConfigReloader(opts: {
     error: (msg: string) => void;
   };
   watchPath: string;
+  /** Optional override for backing up the config before applying a reload. Defaults to timestamp-backup implementation. */
+  backupBeforeReload?: (watchPath: string) => Promise<void>;
 }): GatewayConfigReloader {
   let currentConfig = opts.initialConfig;
   let settings = resolveGatewayReloadSettings(currentConfig);
@@ -202,6 +267,9 @@ export function startGatewayConfigReloader(opts: {
       if (handleInvalidSnapshot(snapshot)) {
         return;
       }
+      // Back up current config before applying the new snapshot
+      const backupFn = opts.backupBeforeReload ?? backupConfigFileBeforeReload;
+      await backupFn(opts.watchPath);
       await applySnapshot(snapshot.config);
     } catch (err) {
       opts.log.error(`config reload failed: ${String(err)}`);

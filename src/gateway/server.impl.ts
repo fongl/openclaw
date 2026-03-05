@@ -1,3 +1,4 @@
+import fs from "node:fs/promises";
 import path from "node:path";
 import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../agents/agent-scope.js";
 import { getActiveEmbeddedRunCount } from "../agents/pi-embedded-runner/runs.js";
@@ -23,6 +24,11 @@ import { applyPluginAutoEnable } from "../config/plugin-auto-enable.js";
 import { resolveMainSessionKey } from "../config/sessions.js";
 import { clearAgentRunContext, onAgentEvent } from "../infra/agent-events.js";
 import {
+  deleteConfigProbeSentinel,
+  readConfigProbeSentinel,
+  writeConfigProbeSentinelSync,
+} from "../infra/config-probe-sentinel.js";
+import {
   ensureControlUiAssetsBuilt,
   resolveControlUiRootOverrideSync,
   resolveControlUiRootSync,
@@ -34,7 +40,12 @@ import { onHeartbeatEvent } from "../infra/heartbeat-events.js";
 import { startHeartbeatRunner, type HeartbeatRunner } from "../infra/heartbeat-runner.js";
 import { getMachineDisplayName } from "../infra/machine-name.js";
 import { ensureOpenClawCliOnPath } from "../infra/path-env.js";
-import { setGatewaySigusr1RestartPolicy, setPreRestartDeferralCheck } from "../infra/restart.js";
+import {
+  emitGatewayRestart,
+  hasUnconsumedRestartSignal,
+  setGatewaySigusr1RestartPolicy,
+  setPreRestartDeferralCheck,
+} from "../infra/restart.js";
 import {
   primeRemoteSkillsCache,
   refreshRemoteBinsForConnectedNodes,
@@ -65,7 +76,7 @@ import {
 import { runOnboardingWizard } from "../wizard/onboarding.js";
 import { createAuthRateLimiter, type AuthRateLimiter } from "./auth-rate-limit.js";
 import { startChannelHealthMonitor } from "./channel-health-monitor.js";
-import { startGatewayConfigReloader } from "./config-reload.js";
+import { backupConfigFileBeforeReload, startGatewayConfigReloader } from "./config-reload.js";
 import type { ControlUiRootState } from "./control-ui.js";
 import {
   GATEWAY_EVENT_UPDATE_AVAILABLE,
@@ -73,6 +84,7 @@ import {
 } from "./events.js";
 import { ExecApprovalManager } from "./exec-approval-manager.js";
 import { NodeRegistry } from "./node-registry.js";
+import { probeGateway } from "./probe.js";
 import type { startBrowserControlServerIfEnabled } from "./server-browser.js";
 import { createChannelManager } from "./server-channels.js";
 import { createAgentEventHandler } from "./server-chat.js";
@@ -172,6 +184,129 @@ function logGatewayAuthSurfaceDiagnostics(prepared: {
     const details = inactiveDetails ?? state.reason;
     logSecrets.info(`[SECRETS_GATEWAY_AUTH_SURFACE] ${path} is ${stateLabel}. ${details}`);
   }
+}
+
+const PROBE_INTERVAL_MS = 2_000;
+const PROBE_TOTAL_MS = 30_000;
+const PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * On startup, check if a config-probe sentinel exists from a prior restart.
+ * - No sentinel  → back up current config as known-good, done.
+ * - attempt >= 3  → give up rolling back, log error.
+ * - Otherwise     → poll health for 30 s; if unhealthy, restore last backup and restart again.
+ */
+async function scheduleStartupConfigProbe(params: {
+  cfg: OpenClawConfig;
+  port: number;
+  resolvedAuth: import("./auth.js").ResolvedGatewayAuth;
+  log: ReturnType<typeof createSubsystemLogger>;
+}): Promise<void> {
+  const { cfg: _cfg, port, resolvedAuth, log: probeLog } = params;
+
+  const sentinel = await readConfigProbeSentinel();
+
+  if (!sentinel) {
+    // Clean startup: back up current config as known-good
+    const bakPath = `${CONFIG_PATH}.bak.known-good`;
+    try {
+      await fs.copyFile(CONFIG_PATH, bakPath);
+      probeLog.info("clean startup: backed up current config as known-good");
+    } catch {
+      // Best-effort; config may not exist yet
+    }
+    return;
+  }
+
+  if (sentinel.attempt >= 3) {
+    probeLog.error(
+      `config rollback exhausted (attempt=${sentinel.attempt}); giving up — manual intervention required`,
+    );
+    await deleteConfigProbeSentinel();
+    return;
+  }
+
+  probeLog.warn(
+    `config-probe sentinel found (attempt=${sentinel.attempt}); polling health for ${PROBE_TOTAL_MS / 1000}s`,
+  );
+
+  const probeUrl = `ws://127.0.0.1:${port}`;
+  const probeAuth: import("./probe.js").GatewayProbeAuth = {};
+  if (resolvedAuth.mode === "token" && resolvedAuth.token) {
+    probeAuth.token = resolvedAuth.token;
+  } else if (resolvedAuth.mode === "password" && resolvedAuth.password) {
+    probeAuth.password = resolvedAuth.password;
+  }
+
+  const startedAt = Date.now();
+  let healthy = false;
+  while (Date.now() - startedAt < PROBE_TOTAL_MS) {
+    try {
+      const result = await probeGateway({
+        url: probeUrl,
+        auth: probeAuth,
+        timeoutMs: PROBE_TIMEOUT_MS,
+      });
+      if (result.ok) {
+        healthy = true;
+        break;
+      }
+    } catch {
+      // Continue polling
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, PROBE_INTERVAL_MS));
+  }
+
+  if (healthy) {
+    probeLog.info("gateway healthy after config restart; removing config-probe sentinel");
+    await deleteConfigProbeSentinel();
+    return;
+  }
+
+  probeLog.error(
+    `gateway unhealthy after ${PROBE_TOTAL_MS / 1000}s; rolling back config and restarting (attempt=${sentinel.attempt + 1})`,
+  );
+
+  // Find the most recent timestamped backup to restore
+  const configDir = path.dirname(CONFIG_PATH);
+  const configBase = path.basename(CONFIG_PATH);
+  const bakPrefix = `${configBase}.bak.`;
+  let backups: string[] = [];
+  try {
+    const all = await fs.readdir(configDir);
+    backups = all
+      .filter((e) => e.startsWith(bakPrefix))
+      .toSorted()
+      .map((e) => path.join(configDir, e));
+  } catch {
+    backups = [];
+  }
+
+  if (backups.length === 0) {
+    probeLog.error("no config backup found for rollback; giving up");
+    await deleteConfigProbeSentinel();
+    return;
+  }
+
+  const latest = backups[backups.length - 1];
+  try {
+    await fs.copyFile(latest, CONFIG_PATH);
+    probeLog.warn(`restored config from backup: ${latest}`);
+  } catch (err) {
+    probeLog.error(`failed to restore config backup: ${String(err)}`);
+    await deleteConfigProbeSentinel();
+    return;
+  }
+
+  // Write new sentinel with incremented attempt, then restart
+  if (!hasUnconsumedRestartSignal()) {
+    try {
+      writeConfigProbeSentinelSync({ attempt: sentinel.attempt + 1 });
+    } catch {
+      // Best-effort
+    }
+  }
+  emitGatewayRestart();
 }
 
 export type GatewayServer = {
@@ -940,8 +1075,19 @@ export async function startGatewayServer(
             error: (msg) => logReload.error(msg),
           },
           watchPath: CONFIG_PATH,
+          backupBeforeReload: backupConfigFileBeforeReload,
         });
       })();
+
+  // Fire-and-forget: check if previous config restart failed health probe, roll back if needed.
+  if (!minimalTestGateway) {
+    void scheduleStartupConfigProbe({
+      cfg: cfgAtStart,
+      port,
+      resolvedAuth,
+      log: log.child("config-probe"),
+    }).catch((err) => log.error(`config probe startup failed: ${String(err)}`));
+  }
 
   const close = createGatewayCloseHandler({
     bonjourStop,

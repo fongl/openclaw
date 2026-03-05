@@ -4,6 +4,7 @@ import {
   resolveGatewaySystemdServiceName,
 } from "../daemon/constants.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { writeConfigProbeSentinelSync } from "./config-probe-sentinel.js";
 import { cleanStaleGatewayProcessesSync, findGatewayPidsOnPortSync } from "./restart-stale-pids.js";
 
 export type RestartAttempt = {
@@ -35,7 +36,7 @@ let pendingRestartTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingRestartDueAt = 0;
 let pendingRestartReason: string | undefined;
 
-function hasUnconsumedRestartSignal(): boolean {
+export function hasUnconsumedRestartSignal(): boolean {
   return emittedRestartToken > consumedRestartToken;
 }
 
@@ -431,6 +432,13 @@ export function scheduleGatewaySigusr1Restart(opts?: {
       pendingRestartTimer = null;
       pendingRestartDueAt = 0;
       pendingRestartReason = undefined;
+      // Write sentinel before any restart path fires so the startup watchdog can
+      // detect a failed boot and roll back config if needed.
+      try {
+        writeConfigProbeSentinelSync({ attempt: 0 });
+      } catch {
+        // Best-effort: don't block restart if sentinel write fails
+      }
       const pendingCheck = preRestartCheck;
       if (!pendingCheck) {
         emitGatewayRestart();
