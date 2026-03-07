@@ -60,6 +60,7 @@ type GatewayRunOpts = {
 };
 
 const gatewayLog = createSubsystemLogger("gateway");
+const watchdogLog = createSubsystemLogger("config-watchdog");
 
 const GATEWAY_RUN_VALUE_KEYS = [
   "port",
@@ -184,21 +185,36 @@ async function runGatewayCommand(opts: GatewayRunOpts) {
 
   // Config rollback watchdog: check for sentinel left over from a prior failed boot.
   {
+    watchdogLog.info("boot started, checking for existing sentinel");
     const existingSentinel = await readConfigProbeSentinel();
     if (existingSentinel) {
+      watchdogLog.info(
+        `existing sentinel found — attempt=${existingSentinel.attempt} writtenAt=${existingSentinel.writtenAt}`,
+      );
       if (isConfigProbeSentinelStale(existingSentinel)) {
+        const age = Date.now() - existingSentinel.writtenAt;
+        watchdogLog.warn(`sentinel is stale (age=${age}ms), ignoring and deleting`);
         // Stale sentinel (OOM kill, operator restart, etc.) — ignore it
         await deleteConfigProbeSentinel();
       } else if (existingSentinel.attempt >= 3) {
+        watchdogLog.error(
+          `attempt limit reached (attempt=${existingSentinel.attempt}), giving up on rollback`,
+        );
         // Exhausted rollback attempts — give up and proceed with current config
         await deleteConfigProbeSentinel();
         gatewayLog.error(
           "config-watchdog: exhausted rollback attempts, proceeding with current config",
         );
       } else {
+        watchdogLog.warn(
+          `previous boot failed, attempting rollback (attempt=${existingSentinel.attempt})`,
+        );
         // Previous boot failed — attempt to restore last backup
         const restored = await restoreLatestConfigBackup(CONFIG_PATH, gatewayLog);
         if (restored) {
+          watchdogLog.info(
+            `backup restored successfully from ${CONFIG_PATH}, exiting for clean restart`,
+          );
           writeConfigProbeSentinelSync({ attempt: existingSentinel.attempt + 1 });
           gatewayLog.warn(
             `config-watchdog: restored backup (attempt ${existingSentinel.attempt + 1}), restarting`,
@@ -206,12 +222,16 @@ async function runGatewayCommand(opts: GatewayRunOpts) {
           // Exit cleanly so systemd/launchctl restarts us with the restored config
           process.exit(0);
         } else {
+          watchdogLog.error("no backup available to restore");
           gatewayLog.error("config-watchdog: no backup to restore, proceeding with current config");
           await deleteConfigProbeSentinel();
         }
       }
+    } else {
+      watchdogLog.info("no existing sentinel found — fresh boot");
     }
     // Write fresh sentinel for this boot; deleted by health probe on success
+    watchdogLog.info("writing fresh sentinel for this boot (attempt=0)");
     writeConfigProbeSentinelSync({ attempt: 0 });
   }
 

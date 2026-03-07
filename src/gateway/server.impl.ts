@@ -125,6 +125,7 @@ export { __resetModelCatalogCacheForTest } from "./server-model-catalog.js";
 ensureOpenClawCliOnPath();
 
 const log = createSubsystemLogger("gateway");
+const watchdogLog = createSubsystemLogger("config-watchdog");
 const logCanvas = log.child("canvas");
 const logDiscovery = log.child("discovery");
 const logTailscale = log.child("tailscale");
@@ -205,6 +206,7 @@ async function scheduleStartupConfigProbe(params: {
   const sentinel = await readConfigProbeSentinel();
 
   if (!sentinel) {
+    watchdogLog.info("no sentinel found at health probe time — skipping");
     // Clean startup: back up current config as known-good
     const bakPath = `${CONFIG_PATH}.bak.known-good`;
     try {
@@ -215,6 +217,8 @@ async function scheduleStartupConfigProbe(params: {
     }
     return;
   }
+
+  watchdogLog.info("health probe started");
 
   if (sentinel.attempt >= 3) {
     probeLog.error(
@@ -256,11 +260,15 @@ async function scheduleStartupConfigProbe(params: {
   }
 
   if (healthy) {
+    watchdogLog.info("health probe passed — gateway healthy, deleting sentinel");
     probeLog.info("gateway healthy after config restart; removing config-probe sentinel");
     await deleteConfigProbeSentinel();
     return;
   }
 
+  watchdogLog.error(
+    `health probe failed after ${PROBE_TOTAL_MS / 1000}s — triggering rollback restart`,
+  );
   probeLog.error(
     `gateway unhealthy after ${PROBE_TOTAL_MS / 1000}s; rolling back config and restarting (attempt=${sentinel.attempt + 1})`,
   );
