@@ -89,6 +89,22 @@ export async function runCli(argv: string[] = process.argv) {
   // Capture all console output into structured logs while keeping stdout/stderr behavior.
   enableConsoleCapture();
 
+  // Write config-probe sentinel ASAP for gateway boots.
+  // If the process crashes before runGatewayCommand() fires (module load failure,
+  // assertSupportedRuntime, etc.), the watchdog can still detect it on next boot.
+  {
+    const earlyPrimary = getPrimaryCommand(normalizedArgv);
+    if (earlyPrimary === "gateway") {
+      try {
+        const { writeConfigProbeSentinelSync } = await import("../infra/config-probe-sentinel.js");
+        writeConfigProbeSentinelSync({ attempt: 0 });
+        console.error("[config-watchdog] early sentinel written (pre-buildProgram)");
+      } catch {
+        // best-effort — don't block startup if state dir is missing
+      }
+    }
+  }
+
   const { buildProgram } = await import("./program.js");
   const program = buildProgram();
 
