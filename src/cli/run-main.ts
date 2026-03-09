@@ -96,9 +96,14 @@ export async function runCli(argv: string[] = process.argv) {
     const earlyPrimary = getPrimaryCommand(normalizedArgv);
     if (earlyPrimary === "gateway") {
       try {
-        const { writeConfigProbeSentinelSync } = await import("../infra/config-probe-sentinel.js");
-        writeConfigProbeSentinelSync({ attempt: 0 });
-        console.error("[config-watchdog] early sentinel written (pre-buildProgram)");
+        const { readConfigProbeSentinel, writeConfigProbeSentinelSync } =
+          await import("../infra/config-probe-sentinel.js");
+        const existingSentinel = await readConfigProbeSentinel();
+        if (!existingSentinel) {
+          writeConfigProbeSentinelSync({ attempt: 0 });
+          console.error("[config-watchdog] early sentinel written (pre-buildProgram)");
+        }
+        // If sentinel already exists, leave it alone — runGatewayCommand will handle it
       } catch {
         // best-effort — don't block startup if state dir is missing
       }

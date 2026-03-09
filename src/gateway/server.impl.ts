@@ -207,14 +207,6 @@ async function scheduleStartupConfigProbe(params: {
 
   if (!sentinel) {
     watchdogLog.info("no sentinel found at health probe time — skipping");
-    // Clean startup: back up current config as known-good
-    const bakPath = `${CONFIG_PATH}.bak.known-good`;
-    try {
-      await fs.copyFile(CONFIG_PATH, bakPath);
-      probeLog.info("clean startup: backed up current config as known-good");
-    } catch {
-      // Best-effort; config may not exist yet
-    }
     return;
   }
 
@@ -263,6 +255,15 @@ async function scheduleStartupConfigProbe(params: {
     watchdogLog.info("health probe passed — gateway healthy, deleting sentinel");
     probeLog.info("gateway healthy after config restart; removing config-probe sentinel");
     await deleteConfigProbeSentinel();
+    // Always update the known-good backup on every successful health probe pass
+    const bakPath = `${CONFIG_PATH}.bak.known-good`;
+    try {
+      await fs.copyFile(CONFIG_PATH, bakPath);
+      probeLog.info(`backed up config as known-good: ${bakPath}`);
+    } catch (err) {
+      probeLog.warn(`failed to back up config: ${String(err)}`);
+    }
+    watchdogLog.info("known-good backup updated");
     return;
   }
 
