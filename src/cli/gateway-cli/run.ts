@@ -187,6 +187,7 @@ async function runGatewayCommand(opts: GatewayRunOpts) {
   {
     watchdogLog.info("boot started, checking for existing sentinel");
     const existingSentinel = await readConfigProbeSentinel();
+    let sentinelWritten = false;
     if (existingSentinel) {
       watchdogLog.info(
         `existing sentinel found — attempt=${existingSentinel.attempt} writtenAt=${existingSentinel.writtenAt}`,
@@ -213,14 +214,15 @@ async function runGatewayCommand(opts: GatewayRunOpts) {
         const restored = await restoreLatestConfigBackup(CONFIG_PATH, gatewayLog);
         if (restored) {
           watchdogLog.info(
-            `backup restored successfully from ${CONFIG_PATH}, exiting for clean restart`,
+            `backup restored successfully from ${CONFIG_PATH}, continuing with restored config`,
           );
           writeConfigProbeSentinelSync({ attempt: existingSentinel.attempt + 1 });
+          sentinelWritten = true;
           gatewayLog.warn(
-            `config-watchdog: restored backup (attempt ${existingSentinel.attempt + 1}), restarting`,
+            `config-watchdog: restored backup (attempt ${existingSentinel.attempt + 1}), starting with restored config`,
           );
-          // Exit cleanly so systemd/launchctl restarts us with the restored config
-          process.exit(0);
+          // DON'T exit — let the gateway start with the restored config.
+          // Health probe will delete the sentinel if healthy, or emitGatewayRestart() if not.
         } else {
           watchdogLog.error("no backup available to restore");
           gatewayLog.error("config-watchdog: no backup to restore, proceeding with current config");
@@ -230,9 +232,11 @@ async function runGatewayCommand(opts: GatewayRunOpts) {
     } else {
       watchdogLog.info("no existing sentinel found — fresh boot");
     }
-    // Write fresh sentinel for this boot; deleted by health probe on success
-    watchdogLog.info("writing fresh sentinel for this boot (attempt=0)");
-    writeConfigProbeSentinelSync({ attempt: 0 });
+    if (!sentinelWritten) {
+      // Write fresh sentinel for this boot; deleted by health probe on success
+      watchdogLog.info("writing fresh sentinel for this boot (attempt=0)");
+      writeConfigProbeSentinelSync({ attempt: 0 });
+    }
   }
 
   const cfg = loadConfig();
