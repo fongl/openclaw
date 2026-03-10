@@ -82,16 +82,10 @@ export async function runCli(argv: string[] = process.argv) {
   // Enforce the minimum supported runtime before doing any work.
   assertSupportedRuntime();
 
-  if (await tryRouteCli(normalizedArgv)) {
-    return;
-  }
-
-  // Capture all console output into structured logs while keeping stdout/stderr behavior.
-  enableConsoleCapture();
-
-  // Write config-probe sentinel ASAP for gateway boots.
-  // If the process crashes before runGatewayCommand() fires (module load failure,
-  // assertSupportedRuntime, etc.), the watchdog can still detect it on next boot.
+  // Write config-probe sentinel ASAP for gateway boots — BEFORE tryRouteCli so the
+  // sentinel is on disk even if ensureConfigReady (called inside tryRouteCli or the
+  // Commander preAction hook) finds invalid config and calls exit(1) before
+  // runGatewayCommand has a chance to run its own watchdog logic.
   {
     const earlyPrimary = getPrimaryCommand(normalizedArgv);
     if (earlyPrimary === "gateway") {
@@ -101,14 +95,22 @@ export async function runCli(argv: string[] = process.argv) {
         const existingSentinel = await readConfigProbeSentinel();
         if (!existingSentinel) {
           writeConfigProbeSentinelSync({ attempt: 0 });
-          console.error("[config-watchdog] early sentinel written (pre-buildProgram)");
+          console.error("[config-watchdog] early sentinel written (pre-route)");
         }
-        // If sentinel already exists, leave it alone — runGatewayCommand will handle it
+        // If sentinel already exists, leave it alone — config-guard or runGatewayCommand
+        // will handle it (rollback on invalid config, or clear on healthy boot).
       } catch {
         // best-effort — don't block startup if state dir is missing
       }
     }
   }
+
+  if (await tryRouteCli(normalizedArgv)) {
+    return;
+  }
+
+  // Capture all console output into structured logs while keeping stdout/stderr behavior.
+  enableConsoleCapture();
 
   const { buildProgram } = await import("./program.js");
   const program = buildProgram();

@@ -92,6 +92,57 @@ export async function ensureConfigReady(params: {
     return;
   }
 
+  // Gateway foreground run (no subcommand): if a watchdog sentinel exists from a
+  // prior failed boot, attempt config rollback here instead of showing doctor UI
+  // and exiting.  This covers the case where invalid config prevents
+  // runGatewayCommand from ever reaching its own sentinel-check logic.
+  if (commandName === "gateway" && !subcommandName) {
+    try {
+      const {
+        readConfigProbeSentinel,
+        writeConfigProbeSentinelSync,
+        deleteConfigProbeSentinel,
+        isConfigProbeSentinelStale,
+      } = await import("../../infra/config-probe-sentinel.js");
+      const existingSentinel = await readConfigProbeSentinel();
+      if (existingSentinel && !isConfigProbeSentinelStale(existingSentinel)) {
+        if (existingSentinel.attempt >= 3) {
+          params.runtime.error(
+            "[config-watchdog] exhausted rollback attempts, proceeding to doctor exit",
+          );
+          await deleteConfigProbeSentinel();
+          // Fall through to the standard invalid-config exit below.
+        } else {
+          const { restoreLatestConfigBackup } = await import("../../gateway/config-backup.js");
+          const { CONFIG_PATH } = await import("../../config/config.js");
+          const log = {
+            warn: (m: string) => params.runtime.error(m),
+            error: (m: string) => params.runtime.error(m),
+          };
+          params.runtime.error(
+            `[config-watchdog] invalid config with sentinel (attempt=${existingSentinel.attempt}), attempting rollback`,
+          );
+          const restored = await restoreLatestConfigBackup(CONFIG_PATH, log);
+          if (restored) {
+            writeConfigProbeSentinelSync({ attempt: existingSentinel.attempt + 1 });
+            // Reset snapshot cache so the next call picks up the restored config.
+            configSnapshotPromise = null;
+            params.runtime.error(
+              `[config-watchdog] rollback succeeded (attempt ${existingSentinel.attempt + 1}), retrying config check`,
+            );
+            return ensureConfigReady(params);
+          } else {
+            params.runtime.error("[config-watchdog] no backup available, cannot rollback");
+            await deleteConfigProbeSentinel();
+            // Fall through to the standard invalid-config exit below.
+          }
+        }
+      }
+    } catch {
+      // best-effort — watchdog failures must never block startup path
+    }
+  }
+
   const rich = isRich();
   const muted = (value: string) => colorize(rich, theme.muted, value);
   const error = (value: string) => colorize(rich, theme.error, value);
