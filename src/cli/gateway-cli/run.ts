@@ -4,6 +4,7 @@ import type { Command } from "commander";
 import type { GatewayAuthMode, GatewayTailscaleMode } from "../../config/config.js";
 import {
   CONFIG_PATH,
+  clearConfigCache,
   loadConfig,
   readConfigFileSnapshot,
   resolveStateDir,
@@ -184,6 +185,9 @@ async function runGatewayCommand(opts: GatewayRunOpts) {
   }
 
   // Config rollback watchdog: check for sentinel left over from a prior failed boot.
+  // didRollback is set true when we successfully restore a backup this boot; it is
+  // used below to bypass the gateway.mode=local guard — we trust the restored config.
+  let didRollback = false;
   {
     watchdogLog.info("boot started, checking for existing sentinel");
     const existingSentinel = await readConfigProbeSentinel();
@@ -207,26 +211,42 @@ async function runGatewayCommand(opts: GatewayRunOpts) {
           "config-watchdog: exhausted rollback attempts, proceeding with current config",
         );
       } else {
-        watchdogLog.warn(
-          `previous boot failed, attempting rollback (attempt=${existingSentinel.attempt})`,
-        );
-        // Previous boot failed — attempt to restore last backup
-        const restored = await restoreLatestConfigBackup(CONFIG_PATH, gatewayLog);
-        if (restored) {
+        // Bug 1 fix: check if config is already valid before rolling back.
+        // ensureConfigReady (preAction hook) may have already restored the backup and
+        // left a fresh-but-incremented sentinel on disk. If the config is now valid,
+        // skip a redundant second rollback and let the health probe clean up the sentinel.
+        const currentSnapshot = await readConfigFileSnapshot();
+        if (currentSnapshot.valid) {
           watchdogLog.info(
-            `backup restored successfully from ${CONFIG_PATH}, continuing with restored config`,
+            `sentinel found (attempt=${existingSentinel.attempt}) but config is already valid — skipping rollback, health probe will clean up sentinel`,
           );
-          writeConfigProbeSentinelSync({ attempt: existingSentinel.attempt + 1 });
-          sentinelWritten = true;
-          gatewayLog.warn(
-            `config-watchdog: restored backup (attempt ${existingSentinel.attempt + 1}), starting with restored config`,
-          );
-          // DON'T exit — let the gateway start with the restored config.
-          // Health probe will delete the sentinel if healthy, or emitGatewayRestart() if not.
         } else {
-          watchdogLog.error("no backup available to restore");
-          gatewayLog.error("config-watchdog: no backup to restore, proceeding with current config");
-          await deleteConfigProbeSentinel();
+          watchdogLog.warn(
+            `previous boot failed, attempting rollback (attempt=${existingSentinel.attempt})`,
+          );
+          // Previous boot failed — attempt to restore last backup
+          const restored = await restoreLatestConfigBackup(CONFIG_PATH, gatewayLog);
+          if (restored) {
+            didRollback = true;
+            watchdogLog.info(
+              `backup restored successfully from ${CONFIG_PATH}, continuing with restored config`,
+            );
+            writeConfigProbeSentinelSync({ attempt: existingSentinel.attempt + 1 });
+            sentinelWritten = true;
+            gatewayLog.warn(
+              `config-watchdog: restored backup (attempt ${existingSentinel.attempt + 1}), starting with restored config`,
+            );
+            // Clear the loadConfig() cache so the next call reads the restored file from disk.
+            clearConfigCache();
+            // DON'T exit — let the gateway start with the restored config.
+            // Health probe will delete the sentinel if healthy, or emitGatewayRestart() if not.
+          } else {
+            watchdogLog.error("no backup available to restore");
+            gatewayLog.error(
+              "config-watchdog: no backup to restore, proceeding with current config",
+            );
+            await deleteConfigProbeSentinel();
+          }
         }
       }
     } else {
@@ -307,7 +327,11 @@ async function runGatewayCommand(opts: GatewayRunOpts) {
   const configExists = snapshot?.exists ?? fs.existsSync(CONFIG_PATH);
   const configAuditPath = path.join(resolveStateDir(process.env), "logs", "config-audit.jsonl");
   const mode = cfg.gateway?.mode;
-  if (!opts.allowUnconfigured && mode !== "local") {
+  // Bug 2 fix: if we just restored a known-good backup this boot, trust it and bypass
+  // the gateway.mode=local guard. The backup was from a healthy run, so starting the
+  // gateway with it is safe. Skipping this guard is equivalent to --allow-unconfigured
+  // for this single recovery boot; the health probe will confirm success.
+  if (!opts.allowUnconfigured && !didRollback && mode !== "local") {
     if (!configExists) {
       defaultRuntime.error(
         `Missing config. Run \`${formatCliCommand("openclaw setup")}\` or set gateway.mode=local (or pass --allow-unconfigured).`,
